@@ -1,7 +1,7 @@
 # security libs or utils
 
 ### certificateUtil.sh
-This utils is works for generate server certificates, you could use as below steps:
+This utils works for generate server certificates, you could use as below steps:
 
 #### create server key and CSR
 1. create server key
