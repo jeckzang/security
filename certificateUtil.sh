@@ -19,7 +19,7 @@ INSTALL_DIR="/opt/poly/vces-configs/certs"
 
 usage() {  
     local prog="`basename $1`"  
-    echo "Usage: [-m method]"  
+    echo "Usage: [-d domain -m method]"  
     echo "       $prog -h for help."  
     echo "  -m   which method do you want to invoke. values are generateRSAPrivateKey,createCSR,signServerCertificate,compineCertificates,convert2JKS,installCertificates(default generateRSAPrivateKey)"
     echo "  -d   domain name for this server."
@@ -53,6 +53,10 @@ do
         *)                  usage $0 ;;  
         esac  
 done
+
+#find keytool
+export JAVA_HOME=$(ls -d /usr/lib/jvm/jdk-11*)
+KeyTool=$JAVA_HOME/bin/keytool
 
 echo "************************"
 echo "METHOD=$METHOD"
@@ -101,6 +105,26 @@ generateRSAPrivateKey(){
     fi
 }
 
+generateSelfsignCertificate(){
+    KeyType="server"    
+    echo "Generating self sign certificate for $KeyType."
+    mkdir -p $TMP_DIR/$KeyType
+    Check="ok"
+    if [ -z "$SUB_COUNTRY" ]; then Check=""; fi
+    if [ -z "$SUB_STATE" ]; then Check=""; fi
+    if [ -z "$SUB_LOCATION" ]; then Check=""; fi
+    if [ -z "$SUB_ORGANIZATION" ]; then Check=""; fi
+    if [ -z "$SUB_ORGANIZATION_UNIT" ]; then Check=""; fi
+    if [ -z "$SUB_COMMON_NAME" ]; then Check=""; fi
+    if [ "$Check" == "ok" ]; then
+        Subject="/C=$SUB_COUNTRY/ST=$SUB_STATE/L=$SUB_LOCATION/O=$SUB_ORGANIZATION/OU=$SUB_ORGANIZATION_UNIT/CN=$SUB_COMMON_NAME"        
+        openssl req -newkey rsa:2048 -nodes -keyout $TMP_DIR/$KeyType/$DOMAIN.key.pem -x509 -days 3650 -out $TMP_DIR/$KeyType/$DOMAIN.certificate.pem -subj $Subject
+    else
+        echo "Subject error."
+        exit -2
+    fi    
+}
+
 createCSR(){ 
     echo "Creating CSR."
     Check="ok"
@@ -111,9 +135,38 @@ createCSR(){
     if [ -z "$SUB_ORGANIZATION_UNIT" ]; then Check=""; fi
     if [ -z "$SUB_COMMON_NAME" ]; then Check=""; fi
     if [ "$Check" == "ok" ]; then
+        tee $TMP_DIR/server/v3.cnf <<EOF
+    [ req ]
+    default_keyfile         = privkey.pem
+    distinguished_name      = req_distinguished_name
+    x509_extensions = v3_ca # The extentions to add to the self signed cert
+    req_extensions  = v3_req
+    x509_extensions = usr_cert
+
+    [ req_distinguished_name ]
+    commonName              = $SUB_COMMON_NAME
+
+    [ usr_cert ]
+    basicConstraints=CA:FALSE
+    nsCertType                      = server
+    keyUsage = nonRepudiation, digitalSignature, keyEncipherment, dataEncipherment
+    extendedKeyUsage = serverAuth, clientAuth, codeSigning
+    nsComment                       = "OpenSSL Generated Certificate"
+    subjectKeyIdentifier=hash
+    authorityKeyIdentifier=keyid,issuer    
+
+    [ v3_req ]
+    basicConstraints        = CA:FALSE
+    extendedKeyUsage        = serverAuth, clientAuth, codeSigning
+    keyUsage                = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+    subjectAltName          = @alt_names
+
+    [ alt_names ]
+    DNS.1                   = $DOMAIN
+EOF
         Subject="/C=$SUB_COUNTRY/ST=$SUB_STATE/L=$SUB_LOCATION/O=$SUB_ORGANIZATION/OU=$SUB_ORGANIZATION_UNIT/CN=$SUB_COMMON_NAME"
         if [ -f $ServerKey ]; then        
-            openssl req -new -key $ServerKey -out $ServerCSR -subj $Subject
+            openssl req -new -config $TMP_DIR/server/v3.cnf -key $ServerKey -out $ServerCSR -subj $Subject
         else
             echo "Key file does not exist, please generate key first."
             exit -1
@@ -132,17 +185,8 @@ signServerCertificate(){
     if [ ! -f $ServerCSR ]; then echo "$ServerCSR does not exist!" && Check=""; fi
     if [ ! -f $CAKey ]; then echo "$CAKey does not exist!" && Check=""; fi 
     if [ ! -f $CACertificate ]; then echo "$CACertificate does not exist!" && Check=""; fi 
-    if [ "$Check" == "ok" ]; then  
-        tee $TMP_DIR/server/v3.ext <<EOF
-    authorityKeyIdentifier=keyid,issuer
-    basicConstraints=CA:FALSE
-    keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
-    subjectAltName = @alt_names
-    
-    [alt_names]
-    DNS.1 = $DOMAIN
-EOF
-        openssl x509 -req -in $ServerCSR -CA $CACertificate -CAkey $CAKey -CAcreateserial -out $ServerCertificate -extfile $TMP_DIR/server/v3.ext      
+    if [ "$Check" == "ok" ]; then          
+        openssl x509 -req -in $ServerCSR -CA $CACertificate -CAkey $CAKey -CAcreateserial -out $ServerCertificate -extensions v3_req -extfile $TMP_DIR/server/v3.cnf
     else
         echo "Key files do not exist, please generate them first."
         exit -1
@@ -155,6 +199,7 @@ compineCertificates(){
     if [ ! -f $ServerCertificate ]; then echo "$ServerCertificate does not exist!" && Check=""; fi    
     if [ ! -f $CACertificate ]; then echo "$CACertificate does not exist!" && Check=""; fi 
     if [ "$Check" == "ok" ]; then  
+        rm -fr $ServerAllCertificate
         touch "$ServerAllCertificate"
         cat $ServerCertificate >> "$ServerAllCertificate"
         cat $CACertificate >> "$ServerAllCertificate"
@@ -189,9 +234,9 @@ convert2JKS(){
         rm -fr $ServerPKCS12
         rm -fr $KeyStroe
         openssl pkcs12 -export -in $ServerAllCertificate -inkey $ServerKey -out $ServerPKCS12 -name poly-vces -passin pass:Polycom123 -passout pass:Polycom123
-        keytool -genkey -keyalg RSA -alias default -keystore $KeyStroe -storepass Polycom123 -dname "CN=poly.com, OU=PCTC, O=Poly, L=Beijing, S=Beijing, C=CN" 
-        keytool -delete -alias default -keystore $KeyStroe -storepass Polycom123
-        keytool -importkeystore -srckeystore $ServerPKCS12 -srcstoretype PKCS12 -srcstorepass Polycom123 -alias poly-vces -deststorepass Polycom123 -destkeypass Polycom123 -destkeystore $KeyStroe
+        $KeyTool -genkey -keyalg RSA -alias default -keystore $KeyStroe -storepass Polycom123 -dname "CN=poly.com, OU=PCTC, O=Poly, L=Beijing, S=Beijing, C=CN" 
+        $KeyTool -delete -alias default -keystore $KeyStroe -storepass Polycom123
+        $KeyTool -importkeystore -srckeystore $ServerPKCS12 -srcstoretype PKCS12 -srcstorepass Polycom123 -alias poly-vces -deststorepass Polycom123 -destkeypass Polycom123 -destkeystore $KeyStroe
     else
         echo "Key files do not exist, please generate them first."
         exit -1
